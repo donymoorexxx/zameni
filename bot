@@ -1,0 +1,115 @@
+"""
+Бот присылает в Telegram замены для группы из таблицы bortech.by.
+
+Запуск:
+    pip install requests
+    python bot.py          # работает постоянно, проверяет таблицу каждые 10 минут
+    python bot.py once     # одна проверка без отправки: покажет, что бот видит в таблице
+"""
+import csv
+import io
+import json
+import os
+import sys
+import time
+
+import requests
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВСТАВЬТЕ_ТОКЕН_ОТ_BOTFATHER")
+CHAT_ID = os.environ.get("CHAT_ID", "ВСТАВЬТЕ_СВОЙ_CHAT_ID")
+GROUP = "3П064"
+CHECK_EVERY = 600  # секунд
+
+# Таблица, встроенная на странице «Замены» (опубликованный Google Sheets)
+SHEET_ID = "2PACX-1vRgODzWJhSfml2SVezD2P4wdEyp92gZ7y3-tyjFssLI80j3CCTv7-cmJhcCsvQNKcPnzP-m2r9pswd8"
+CSV_URL = f"https://docs.google.com/spreadsheets/d/e/{SHEET_ID}/pub?output=csv"
+
+STATE_FILE = "last_state.json"
+
+# Латинские буквы-двойники -> кириллица (чтобы "3P064" и "3П064" не путались)
+LAT2CYR = str.maketrans("ABCEHKMOPTX", "АВСЕНКМОРТХ")
+
+
+def norm(s: str) -> str:
+    return s.strip().upper().translate(LAT2CYR).replace(" ", "")
+
+
+def clean(cell: str) -> str:
+    return " / ".join(p.strip() for p in cell.splitlines() if p.strip())
+
+
+def fetch_row():
+    """Возвращает строку таблицы для нашей группы (список ячеек) или None."""
+    r = requests.get(CSV_URL, timeout=30)
+    r.raise_for_status()
+    r.encoding = "utf-8"
+    for row in csv.reader(io.StringIO(r.text)):
+        if row and norm(row[0]) == norm(GROUP):
+            cells = [clean(c) for c in row]
+            while cells and not cells[-1]:
+                cells.pop()
+            return cells
+    return None
+
+
+def format_row(cells) -> str:
+    lines = [f"Замены для {GROUP}:"]
+    rest = cells[1:]
+    # столбцы идут парами: предмет, кабинет
+    for i in range(0, len(rest), 2):
+        subject = rest[i]
+        room = rest[i + 1] if i + 1 < len(rest) else ""
+        if not subject and not room:
+            continue
+        line = f"{i // 2 + 1} пара: {subject or '—'}"
+        if room:
+            line += f", каб. {room}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def send(text: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=30).raise_for_status()
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False)
+
+
+def check():
+    cells = fetch_row()
+    state = cells  # None, если группы в таблице нет
+    if state == load_state():
+        return
+    if cells is None:
+        send(f"Строка группы {GROUP} пропала из таблицы замен.")
+    else:
+        send(format_row(cells))
+    save_state(state)
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "once":
+        cells = fetch_row()
+        print(format_row(cells) if cells else f"Группа {GROUP} в таблице не найдена")
+        return
+    while True:
+        try:
+            check()
+        except Exception as e:  # сеть моргнула и т.п. — просто пробуем позже
+            print("Ошибка:", e)
+        time.sleep(CHECK_EVERY)
+
+
+if __name__ == "__main__":
+    main()
